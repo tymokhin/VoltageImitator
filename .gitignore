@@ -1,0 +1,22 @@
+History
+__Previews
+tmp
+*.Dat
+Status Report.Txt
+Fabrication/Current
+Fabricate/Current
+History
+Project Logs*
+Project Outputs*
+Design Rule Check*
+*.log
+PowerAnalyzerByKeysight*
+PDNAnalyzer_Output*
+*.html
+Debug
+Release
+Fabrication
+FreeRTOS
+Drivers
+~*
+*~.*
