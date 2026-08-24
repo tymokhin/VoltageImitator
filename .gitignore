@@ -16,7 +16,5 @@ PDNAnalyzer_Output*
 Debug
 Release
 Fabrication
-FreeRTOS
-Drivers
 ~*
 *~.*
