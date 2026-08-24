@@ -169,6 +169,26 @@ SECTIONS
     _eccmram = .;       /* create a global symbol at ccmram end */
   } >CCMRAM AT> FLASH
 
+  /* Неініціалізовані гарячі дані у CCM RAM.
+   *
+   * NOLOAD - принципово: startup_stm32f334c8tx.s копіює лише .data і чистить
+   * лише .bss, вміст .ccmram він НЕ переносить. Тому сюди можна класти
+   * виключно те, що код заповнює сам у runtime. Змінна з ініціалізатором,
+   * покладена в цю секцію, мовчки залишиться зі сміттям.
+   *
+   * DMA на STM32F3 до CCM доступу НЕ має - буфери DMA сюди класти не можна. */
+  /* Ім'я НЕ повинно починатися з ".ccmram": секція .ccmram вище має маску
+   * *(.ccmram*), яка інакше перехоплює цей вміст і кладе його у Flash. */
+  .ccm_bss (NOLOAD) :
+  {
+    . = ALIGN(4);
+    _sccm_bss = .;
+    *(.ccm_bss)
+    *(.ccm_bss*)
+    . = ALIGN(4);
+    _eccm_bss = .;
+  } >CCMRAM
+
   /* Uninitialized data section into "RAM" Ram type memory */
   . = ALIGN(4);
   .bss :

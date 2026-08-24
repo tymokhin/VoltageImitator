@@ -1,323 +1,443 @@
 # VoltageImitator Firmware
 
-Прошивка для `STM32F334C8T6`, створена в `STM32CubeIDE` для генерації керованих PWM/SPWM-сигналів, синхронного вимірювання через ADC і подальшої побудови замкненого контуру керування для імітації напруги або струму в експериментах з релейним захистом.
+Прошивка `STM32F334C8T6` для імітатора вхідних сигналів пристроїв РЗА.
+Формує до чотирьох незалежних каналів (UA, UB, UC, 3U0) синусоїдою з
+гармоніками до 10-ї включно та аперіодичною складовою, і тримає форму
+**замкненим контуром керування по зворотному зв'язку з ADC**.
+
+---
+
+## 1. Що працює просто зараз
+
+- **Прошивка стартує сама.** UART не потрібен: після подачі живлення
+  генератор калібрується по об'єкту й виходить на робочу амплітуду
+  приблизно за 0.5 с. Вимикається одним `WG_AUTOSTART = 0`.
+- HRTIM1 формує PWM 100 кГц на чотирьох виходах (`PA8..PA11`).
+- HRTIM master запускає АЦП **чотири рази за період PWM** (маска
+  `CMP1..CMP4`), DMA збирає 16 груп вибірок за такт контуру, і вони
+  усереднюються — це гасить пульсацію комутації у зворотному зв'язку.
+- Такт контуру керування (`HAL_ADC_ConvCpltCallback`) синтезує завдання,
+  рахує регулятор і пише `CMPx` — усе за один прохід, без задач FreeRTOS.
+- USART3 приймає текстові команди: завдання, гармоніки, коефіцієнти
+  регулятора, калібрування, розклад змін у часі, телеметрія.
+- Розпаяний і працює **лише канал 0** (диференційний вхід: сигнал `PA2`,
+  опора `PA3`). Канали 1..3 автоматично працюють у розімкненому контурі,
+  доки їхні входи не з'являться в залізі.
+
+---
+
+## 2. Архітектура такту керування
+
+```
+HRTIM master CMP1
+      │  (100 кГц / WG_CONTROL_DECIMATION)
+      ▼
+ADC trigger 1 ──► ADC1 (master) + ADC2 (slave), 2 ранги, dual simultaneous
+                        │
+                        ▼
+                DMA1_Ch1 ──► g_adc_dma_buffer[2]  (32 біти: ADC2<<16 | ADC1)
+                        │
+                        ▼
+            HAL_ADC_ConvCpltCallback  ◄── тут увесь контур
+                        │
+      ┌─────────────────┼──────────────────────────┐
+      ▼                 ▼                          ▼
+ розпаковка      застосування            для кожного каналу:
+ 4 відліків      запланованих змін       синтез → регулятор → CMPx
+```
+
+Ключове рішення: **точки хвилі не програються з буфера**. Завдання
+обчислюється щотакту, бо регулятор має щотакту порівнювати його з
+виміряним значенням. Старий каркас із burst-DMA і подвійною буферизацією
+`pwm_buffer` прибраний — він несумісний із зворотним зв'язком.
+
+### Синтез завдання
+
+```
+ref(t) = 2048 + Σ A_k · sin(k·ωt + φ_k + k·φ_ch) + A_ap · e^(−t/τ)
+```
+
+- LUT на 512 точок із лінійною інтерполяцією (похибка ≈ −94 дБ);
+- фазовий акумулятор Q32 на канал, тому частота в кожного своя —
+  це потрібно для перевірки контролю синхронізму (ANSI 25);
+- у гарячому циклі перебираються лише ненульові гармоніки.
+
+### Регулятор
+
+```
+err  = ref − fb
+ff   = FF · (ref − 2048)                      прямий зв'язок
+pi   = KP·err + ∫KI·err·dt                    PI
+res  = 2·wc·KR·xa                             резонатор на основній частоті
+duty = center + ff + clamp(pi + res, ±LIM)
+```
+
+Резонансний член — це не прикраса. Звичайний PI має скінченне підсилення
+на 50 Гц, тому на змінному завданні завжди лишається стала похибка по
+амплітуді й фазі. Демпфований резонатор
+`2·wc·s / (s² + 2·wc·s + w0²)` дає одиничне підсилення рівно на основній
+частоті й нульове на постійному струмі, тобто прибирає цю похибку й не
+конфліктує з інтегратором. Реалізований парою станів (SOGI) із
+напівнеявним Ейлером — стійкий, поки `wc·Ts ≪ 1`.
+
+Захисти: заморожування інтегратора й резонатора при `|err| >
+WG_ERROR_FREEZE_ADC` (anti-windup + захист від обриву кола ЗЗ), автоматичний
+перехід у розімкнений контур при насиченні входу ЗЗ довше
+`WG_FEEDBACK_FAULT_TICKS`.
+
+---
+
+## 3. Тактування — важливе
+
+| Таймер | Прескалер | Період | Частота |
+|--------|-----------|--------|---------|
+| Timer A, Timer B | `MUL32` (4.608 ГГц) | 46080 | 100 кГц (PWM) |
+| Master | `MUL4` (576 МГц) | 5760 | 100 кГц (вибірка АЦП) |
+
+Період master дорівнює рівно одному періоду PWM. Частоту такту контуру
+задає **довжина буфера DMA**, а не період таймера: переривання приходить,
+коли зібрано `WG_ADC_TRIGGERS_PER_PWM · WG_CONTROL_DECIMATION` груп вибірок.
+За замовчуванням 4 × 4 = 16 груп → контур 25 кГц. Деталі — розділ 4.
+
+> У згенерованому CubeMX коді master мав `MUL4` при `Period = 46080`,
+> тобто `N = 8` (12.5 кГц), тоді як увесь розрахунок частоти й фази
+> припускав 100 кГц — частота на виході виходила у 8 разів нижчою.
+> Тепер період master задається явно в `WgConfigureTiming()` і не
+> залежить від того, що згенерує CubeMX.
 
-Проєкт використовує `STM32 HAL`, `CMSIS` і `FreeRTOS`. У коді вже є базова апаратна конфігурація та каркас прикладної логіки, але повний робочий контур `HRTIM -> ADC -> DMA -> обробка -> оновлення PWM` ще не завершений.
+Точки вибірки — `WG_ADC_TRIGGERS_PER_PWM` рівномірно рознесених моментів
+усередині кожного періоду PWM, у частках `(2i+1)/(2N)`: не на краях, де
+комутаційні викиди найбільші.
 
-## Що це за проєкт
-
-За задумом і за наявним кодом цей firmware має:
-
-- генерувати високочастотний PWM через `HRTIM1`;
-- формувати вихідну хвилю через LUT і оновлення `CMPx`;
-- синхронно з PWM запускати вибірку `ADC1/ADC2`;
-- використовувати `DMA` для перенесення вибірок і, імовірно, для burst-оновлення `HRTIM`;
-- у перспективі виконувати PI/PID-корекцію на основі виміряного сигналу;
-- приймати параметри сигналу через `USART3`;
-- взаємодіяти з енкодером і LCD.
-
-Із контекстного опису проєкту також випливає цільова архітектура:
-
-- частота PWM порядку `100 kHz`;
-- цільова вихідна хвиля порядку `50 Hz`;
-- LUT-підхід замість важких обчислень у швидкому контурі;
-- підтримка кількох каналів або фаз;
-- використання `Master Timer` HRTIM для синхронізації та ADC-trigger.
+### Бюджет ядра
 
-Ці пункти добре узгоджуються з кодом і `.ioc`, але не все з цього вже реалізовано в runnable-логіці.
+72 МГц, один такт контуру при N=4 — це 2880 тактів ядра.
 
-## Цільова платформа
+| Конфігурація | Оцінка тактів | 100 кГц (720) | 25 кГц (2880) |
+|---|---|---|---|
+| 1 канал, лише основна | ~450 | впритул | вільно |
+| 4 канали, лише основна | ~1000 | ні | вільно |
+| 4 канали × 5 гармонік | ~1400 | ні | вільно |
+| 4 канали × 10 гармонік | ~1800–2000 | ні | ~65–70 % |
 
-- MCU: `STM32F334C8T6`
-- Сімейство: `STM32F3`
-- IDE: `STM32CubeIDE`
-- RTOS: `FreeRTOS`
-- Toolchain у `Debug`: `GNU Tools for STM32 (13.3.rel1)`
+Тобто **на 100 кГц чотири канали не встигають у жодній конфігурації**.
+25 кГц дає 500 точок на період 50 Гц і Найквіст 12.5 кГц — 10-та
+гармоніка (500 Гц) відтворюється з великим запасом.
+
+Реальне значення дивись у `GET STATE` → `LOAD` (проміле від бюджету такту,
+вимірюється лічильником тактів ядра DWT). Якщо стабільно > 700 —
+збільшуй `WG_CONTROL_DECIMATION`. `OVR=1` означає, що такт не встиг.
 
-У [Core/Src/main.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Core/Src/main.c) система налаштована на роботу від `HSE` з PLL. Частота ядра в [conf/FreeRTOSConfig.h](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/conf/FreeRTOSConfig.h) очікується як `SystemCoreClock`, а тік `FreeRTOS` задано `1000 Hz`.
+**Оптимізація обов'язкова.** Конфігурація `Debug` у STM32CubeIDE
+збирається з `-O0`, на якому такт розтягується приблизно втричі.
+`wave_generator_task.c` тому містить `#pragma GCC optimize` і
+оптимізується завжди. Для робочої прошивки все одно варто перемкнути
+проєкт на `-O2`.
+
+---
+
+## 4. Послідовність старту й придушення пульсацій
+
+### Чому знадобилось і те, й інше
+
+Вимір на платі: при статичних 50 % шпаруватості на вході АЦП **600 мВ
+розмаху** пульсацій частоти комутації. Це ~745 відліків АЦП, тобто ~31 %
+від корисного сигналу при `AMP=1200`. Одна вибірка за такт означала б, що
+регулятор бачить переважно пульсацію. Плюс контур працює на 25 кГц, а вміст
+на вході 100 кГц і вище — усе, що не кратне 25 кГц, згортається прямо в
+смугу сигналу, і в цифрі це вже не виправити.
+
+### Придушення пульсації: кілька вибірок усередині періоду
 
-## Апаратні блоки, які реально налаштовані
-
-За [VoltageImitator.ioc](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/VoltageImitator.ioc), [Core/Src/main.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Core/Src/main.c) і [Core/Src/stm32f3xx_hal_msp.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Core/Src/stm32f3xx_hal_msp.c) в проєкті використані:
-
-- `HRTIM1`
-- `ADC1`
-- `ADC2`
-- `DMA1_Channel1` для `ADC1`
-- `USART3`
-- `SPI1`
-- `TIM2` у режимі encoder
-- GPIO для LCD, енкодера, службових виходів і SWD
-
-Ключові виводи з [Core/Inc/main.h](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Core/Inc/main.h):
-
-- `PA8` -> `HRTIM1_CHA1`
-- `PA9` -> `HRTIM1_CHA2`
-- `PA10` -> `HRTIM1_CHB1`
-- `PA11` -> `HRTIM1_CHB2`
-- `PB10` / `PB11` -> `USART3_TX/RX`
-- `PB3` / `PB5` -> `SPI1_SCK/MOSI`
-- `PA0` / `PA1` -> енкодер `TIM2`
-- `PA15`, `PB4`, `PB6` -> сигнали LCD
-
-## Поточна структура проєкту
-
-- [Core](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Core) - точка входу, startup, IRQ, HAL MSP, системний код.
-- [Task](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task) - прикладні задачі генератора та UART.
-- [Task/HAL](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/HAL) - окремі заготовки для роботи з ADC/HRTIM.
-- [conf](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/conf) - `FreeRTOSConfig`.
-- [Drivers](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Drivers) - HAL/CMSIS від ST.
-- [FreeRTOS](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/FreeRTOS) - ядро FreeRTOS.
-- [Debug](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Debug) - згенеровані артефакти збірки.
-- [VoltageImitator.ioc](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/VoltageImitator.ioc) - апаратна конфігурація CubeMX.
-
-## Фактична послідовність запуску
-
-У [Core/Src/main.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Core/Src/main.c) виконується:
-
-1. `HAL_Init()`
-2. `SystemClock_Config()`
-3. `MX_GPIO_Init()`
-4. `MX_DMA_Init()`
-5. `MX_HRTIM1_Init()`
-6. `MX_ADC1_Init()`
-7. `MX_ADC2_Init()`
-8. `MX_USART3_UART_Init()`
-9. `MX_TIM2_Init()`
-10. `MX_SPI1_Init()`
-11. `CreatePWMTask()`
-12. `vTaskStartScheduler()`
-
-Що важливо:
-
-- калібрування `ADC1/ADC2` зараз закоментоване;
-- старт виходів HRTIM і старт лічильників HRTIM зараз закоментовані;
-- явного старту `ADC + DMA` в `main()` теж немає.
-
-Тобто ініціалізація периферії відбувається, але власне генерація та вимірювання в поточній ревізії не запускаються.
-
-## Реальна конфігурація HRTIM
-
-У [Core/Src/main.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Core/Src/main.c) для `HRTIM1` налаштовано:
-
-- `ADC Trigger 1`: `HRTIM_ADCTRIGGEREVENT13_MASTER_PERIOD`
-- `ADC trigger update source`: `HRTIM_ADCTRIGGERUPDATE_MASTER`
-- burst mode: `HRTIM_BURSTMODE_CONTINOUS`
-- burst trigger: `HRTIM_BURSTMODETRIGGER_TIMERA_RESET`
-- `PWM_PERIOD = 46080`
-- Master timer prescaler: `HRTIM_PRESCALERRATIO_MUL4`
-- Timer A prescaler: `HRTIM_PRESCALERRATIO_MUL32`
-- Timer B prescaler: `HRTIM_PRESCALERRATIO_MUL32`
-
-Виходи налаштовані так:
-
-- `TA1`: `SET = TIMCMP1`, `RESET = TIMPER`
-- `TA2`: `SET = TIMCMP2`, `RESET = TIMPER`
-- `TB1`: `SET = TIMPER`, `RESET = TIMCMP1`
-- `TB2`: `SET = NONE`, `RESET = NONE`
-
-Початкові compare-значення:
-
-- `Timer A / CMP1 = 96`
-- `Timer A / CMP2 = 96`
-- `Timer B / CMP1 = PWM_PERIOD / 5`
-
-Для Timer A увімкнено:
-
-- `PreloadEnable = HRTIM_PRELOAD_ENABLED`
-- `UpdateGating = HRTIM_UPDATEGATING_INDEPENDENT`
-- `UpdateTrigger = HRTIM_TIMUPDATETRIGGER_TIMER_A`
-- `ResetUpdate = HRTIM_TIMUPDATEONRESET_ENABLED`
-
-Це добре узгоджується з вашим контекстом про чутливість HRTIM до preload/update-конфігурації при переході від одного каналу до кількох.
-
-## Реальна конфігурація ADC
-
-### ADC1
-
-У [Core/Src/main.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Core/Src/main.c) для `ADC1` налаштовано:
-
-- режим `ADC_DUALMODE_REGSIMULT`
-- зовнішній тригер `ADC_EXTERNALTRIGCONVHRTIM_TRG1`
-- фронт тригера `RISING`
-- `NbrOfConversion = 2`
-- `DMAContinuousRequests = ENABLE`
-- `DMA circular` через `DMA1_Channel1`
-
-Порядок regular ranks:
-
-- rank 1 -> `ADC_CHANNEL_3`
-- rank 2 -> `ADC_CHANNEL_11`
-
-За [Core/Src/stm32f3xx_hal_msp.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Core/Src/stm32f3xx_hal_msp.c) це відповідає:
-
-- `PA2` / `ADC1_IN3`
-- `PB0` / `ADC1_IN11`
-
-### ADC2
-
-Для `ADC2` налаштовано:
-
-- `NbrOfConversion = 2`
-- `DMAContinuousRequests = DISABLE`
-- same dual regular simultaneous scheme разом із `ADC1`
-
-Порядок regular ranks:
-
-- rank 1 -> `ADC_CHANNEL_1`
-- rank 2 -> `ADC_CHANNEL_3`
-
-За MSP-конфігурацією це відповідає:
-
-- `PA4` / `ADC2_IN1`
-- `PA6` / `ADC2_IN3`
-
-### Практичний зміст
-
-Контекстний файл правильно підкреслює, що для такого проєкту треба явно фіксувати порядок rank-ів і layout DMA-буфера. У поточному коді сама ідея синхронного вимірювання є, але структура даних для чіткої прив’язки `rank -> signal` ще не доведена до цілісного рішення в продакшн-коді.
-
-## Прикладна логіка та стан реалізації
-
-### `wave_generator_task.c`
-
-У [Task/wave_generator_task.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/wave_generator_task.c):
-
-- створюється задача `pwm_task`;
-- задано `SAMPLE_RATE = 100000UL`, що збігається з очікуваним PWM-порядком із контексту;
-- описано LUT-буфер `cmp_lut`;
-- є заготовка побудови синусоподібного профілю через `sinf()`;
-- є заготовки для `HAL_DMA_Start(... -> BDMADR)` та запуску `TA1/TA2`.
-
-Водночас у поточному стані:
-
-- головна робоча логіка майже повністю закоментована;
-- `pwm_task()` фактично містить порожній `for (;;)` без обчислень і без старту периферії;
-- використовується лише `CreatePWMTask()`, але не реальний fast control loop.
-
-### `uart_task.c`
-
-У [Task/uart_task.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/uart_task.c) є тільки заглушка `handle_uart_command(...)`. Ідея з контекстного файлу про передачу параметрів типу `A`, `alpha`, `phi`, `freq` поки в коді не реалізована.
-
-### `Task/HAL`
-
-У [Task/HAL/hrtim.h](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/HAL/hrtim.h) і [Task/HAL/adc.h](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/HAL/adc.h) є окремі визначення:
-
-- `PWM_BUFFER_LEN = 128`
-- `PWM_CHANNELS = 4`
-- `SignalParams { A, alpha, phi, freq, dt }`
-- `adc_dma_buffer[2][ADC_BUFFER_LENGTH]`
-
-Це добре стикується з вашим загальним задумом:
-
-- кілька каналів;
-- LUT-параметризація;
-- буферизація виміряних даних;
-- підготовка до регулятора.
-
-## Виявлені неузгодженості в коді
-
-Нижче перелік речей, які варто знати перед продовженням роботи. Це не припущення, а те, що видно з поточної кодової бази.
-
-### 1. Генерація і вимірювання не стартують у `main`
-
-У `main()` закоментовані:
-
-- `HAL_HRTIM_WaveformOutputStart(...)`
-- `HAL_HRTIM_WaveformCounterStart(...)`
-- калібрування ADC
-
-Також немає виклику на кшталт `HAL_ADCEx_MultiModeStart_DMA(...)` або аналогічного старту перетворень.
-
-### 2. Callback-и ADC реалізовані двічі
-
-Одна реалізація є в [Task/wave_generator_task.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/wave_generator_task.c), друга - в [Task/HAL/adc.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/HAL/adc.c).
-
-Для weak callback-механізму HAL це означає, що треба залишити лише одну узгоджену реалізацію, інакше збірка або поведінка будуть проблемними.
-
-### 3. `ProcessAdcData(...)` лише оголошена
-
-У [Task/HAL/adc.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/HAL/adc.c) є:
-
-- `extern void ProcessAdcData(uint16_t* adc_buffer, uint16_t buf_length);`
-
-Але реалізації цієї функції в проєкті не знайдено.
-
-### 4. `hdma_hrtim1_a` використовується як `extern`
-
-У [Task/wave_generator_task.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/wave_generator_task.c) та [Task/HAL/hrtim.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/HAL/hrtim.c) присутній:
-
-- `extern DMA_HandleTypeDef hdma_hrtim1_a;`
-
-Але визначення цього DMA handle в поточних файлах проєкту не видно. Якщо HRTIM DMA планується використовувати далі, цю частину треба або доробити, або прибрати застарілі посилання.
-
-### 5. `Task/HAL` треба перевірити на реальну участь у збірці
-
-У [Debug/Task/HAL/subdir.mk](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Debug/Task/HAL/subdir.mk) є правила для `adc.c` і `hrtim.c`, але у [Debug/sources.mk](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Debug/sources.mk) каталог `Task/HAL` відсутній у `SUBDIRS`.
-
-Тобто код `Task/HAL` явно існує як частина задуму, але актуальний стан його включення в згенеровану збірку треба перевірити окремо в IDE.
-
-## FreeRTOS
-
-У [conf/FreeRTOSConfig.h](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/conf/FreeRTOSConfig.h):
-
-- `configMAX_PRIORITIES = 5`
-- `configMINIMAL_STACK_SIZE = 130`
-- `configTOTAL_HEAP_SIZE = 4096`
-- `configUSE_MUTEXES = 1`
-- `configSUPPORT_STATIC_ALLOCATION = 1`
-- `configSUPPORT_DYNAMIC_ALLOCATION = 1`
-- software timers вимкнені: `configUSE_TIMERS = 0`
-
-У [Task/wave_generator_task.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/wave_generator_task.c) задача `PWM` створюється з пріоритетом `configMAX_PRIORITIES - 1`, тобто майже максимальним.
-
-Це відповідає задуму, що важка периферійна логіка має бути ближче до high-priority execution, хоча з вашого контексту видно, що критичний fast loop все одно краще тримати на рівні timer/DMA/ISR, а не у blocking task.
-
-## Збірка
-
-### Через STM32CubeIDE
-
-1. Відкрити каталог проєкту в `STM32CubeIDE`.
-2. Імпортувати існуючий проєкт Eclipse/STM32CubeIDE.
-3. За потреби відкрити [VoltageImitator.ioc](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/VoltageImitator.ioc) і перегенерувати код.
-4. Зібрати конфігурацію `Debug`.
-
-У каталозі [Debug](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Debug) очікуються:
-
-- `VoltageImitator.elf`
-- `VoltageImitator.hex`
-- `VoltageImitator.map`
-
-### Через makefile
-
-STM32CubeIDE генерує make-based збірку в каталозі `Debug`, тому проєкт зазвичай можна збирати і поза IDE, якщо доступний toolchain від STM32CubeIDE.
-
-## Прошивка та налагодження
-
-У проєкті є конфігурація запуску [VoltageImitator Debug.launch](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/VoltageImitator%20Debug.launch), яку можна використати для запуску або відлагодження через ST-LINK.
-
-Типовий сценарій:
-
-- збірка в `Debug`;
-- прошивка `VoltageImitator.elf` або `VoltageImitator.hex`;
-- контроль сигналів `PA8/PA9/PA10/PA11`;
-- окрема перевірка фактичного старту HRTIM counters, ADC trigger та DMA callback.
-
-## Рекомендовані наступні кроки
-
-1. Узгодити єдину точку входу для `HAL_ADC_ConvHalfCpltCallback` і `HAL_ADC_ConvCpltCallback`.
-2. Додати реальний старт послідовності `ADC calibration -> HRTIM start -> ADC/DMA start`.
-3. Явно описати формат DMA-буфера для пари `ADC1/ADC2` і прив’язку `rank -> signal`.
-4. Доробити або видалити незавершений шлях із `hdma_hrtim1_a`.
-5. Реалізувати `ProcessAdcData(...)` і визначити, де саме виконується fast control.
-6. Завершити UART-протокол зміни параметрів сигналу.
-7. Після стабілізації коду оновити README ще раз уже під фактичний runtime-потік, а не під поточний каркас.
-
-## Файли, з яких варто починати
-
-- [Core/Src/main.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Core/Src/main.c) - ініціалізація та порядок запуску.
-- [Core/Src/stm32f3xx_hal_msp.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Core/Src/stm32f3xx_hal_msp.c) - відповідність периферії та GPIO.
-- [Task/wave_generator_task.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/wave_generator_task.c) - основна ідея генератора та LUT.
-- [Task/HAL/adc.c](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/HAL/adc.c) - заготовка ADC DMA обробки.
-- [Task/HAL/hrtim.h](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/Task/HAL/hrtim.h) - параметри каналів і структура сигналу.
-- [conf/FreeRTOSConfig.h](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/conf/FreeRTOSConfig.h) - параметри RTOS.
-- [VoltageImitator.ioc](D:/Projects/PowerNetworkImitator/VoltageImitator/firmware/STM32CubeIDE/VoltageImitator.ioc) - істина щодо периферії CubeMX.
+Master тепер має період рівно **одного** періоду PWM, а всередині нього
+стоять `WG_ADC_TRIGGERS_PER_PWM` рівномірно рознесених точок вибірки —
+через `CMP1..CMP4`, бо регістр `ADC1R` приймає маску подій. Частоту такту
+контуру задає не період master, а довжина буфера DMA.
+
+Ключова деталь: вибірки лягають **усередину** періоду пульсації, а не через
+період. Ковзне середнє по точках, що рівномірно вкривають період, має нуль
+АЧХ рівно на частоті комутації та її гармоніках — пульсація гаситься за
+побудовою, а не просто послаблюється. Переривань це не додає: DMA накопичує
+все сам, переривання приходить раз на такт контуру.
+
+Час вибірки АЦП довелося скоротити до 19.5 циклів (у `main.c`, секції
+`ADC*_Init 2`). При 4 тригерах вікно між ними 2.5 мкс, а два ранги з рідними
+61.5 циклами займають 2.06 мкс — будь-який джитер губить тригер, а
+втрачений тригер зриває вирівнювання буфера DMA і зупиняє контур.
+
+### Самокалібрування об'єкта
+
+Замикати контур наосліп не можна, і найнебезпечніше — **знак**. Якщо вхідне
+коло інвертує, зворотний зв'язок стає додатним і вихід миттєво йде в полицю.
+Без UART ні знак, ні підсилення підібрати нема чим. Тому на старті:
+
+| Фаза | Що відбувається |
+|---|---|
+| `SETTLE`, 150 мс | амплітуда нуль, duty у центрі; усереднюється ЗЗ → це дає реальний `offset_adc`, а не теоретичні 2048 |
+| `PROBE`, ~160 мс | розімкнений контур, синус малої амплітуди; накопичуються `Σ(ref·fb)` і `Σ(ref²)` |
+| `APPLY` | `g = Σ(ref·fb)/Σ(ref²)` — оцінка наскрізного підсилення методом найменших квадратів, **разом зі знаком**; усі коефіцієнти множаться на `1/P`; контур замикається |
+| ramp, 300 мс | амплітуда лінійно піднімається до робочої |
+
+Кореляційна оцінка стійка до пульсацій: усе, що не корельоване із завданням,
+у сумі прямує до нуля. Якщо відгук замалий, проба повторюється з учетверо
+більшим feedforward (до `WG_CAL_ATTEMPTS` разів), але модуляція duty жорстко
+обмежена `WG_CAL_MAX_MODULATION_TICKS`. Проба **тільки змінним струмом** —
+постійна складова ввела б трансформаторний вихід у насичення.
+
+Саме тому коефіцієнти в конфігурації задані **нормовано** (`WG_PI_KP_NORM`
+тощо) — у частках підсилення об'єкта. `KP = 0.2` означає «петльове
+підсилення 0.2», незалежно від напруги живлення й дільників.
+
+Якщо калібрування не вдалося, канал лишається розімкненим із безпечним
+feedforward і піднімає прапорець — сигнал усе одно генерується.
+
+### Як зрозуміти результат без UART
+
+Дивись на осцилограф, **5 мс/поділку** (не 5 мкс: період 50 Гц це 20 мс, на
+швидкій розгортці синуса не видно в принципі).
+
+- Калібрування вдалося → на вході АЦП синус ~1.93 В розмаху, тобто рівно
+  задана амплітуда 1200 відліків. Контур тримає її сам.
+- Не вдалося → розімкнений контур із `FF = 2.0`, модуляція лише 10 %,
+  амплітуда буде помітно меншою й «плаватиме».
+
+Коли з'явиться UART, `GET STATE` покаже це явно: `CAL=1` успіх, `CAL=2`
+невдача, `CAL=0` калібрування ще триває.
+
+---
+
+## 5. Канали
+
+| ch | Призначення | Вихід | Таймер | Compare | Зворотний зв'язок |
+|----|-------------|-------|--------|---------|-------------------|
+| 0 | UA | TA1 `PA8` | A | CMP1 | ADC1 rank1, CH3 diff `PA2`/`PA3` ✅ |
+| 1 | UB | TA2 `PA9` | A | CMP2 | ADC1 rank2, CH11 `PB0` |
+| 2 | UC | TB1 `PA10` | B | CMP1 | ADC2 rank1, CH1 diff `PA4` |
+| 3 | 3U0 / Un | TB2 `PA11` | B | CMP2 | ADC2 rank2, CH3 diff `PA6` |
+
+Два виходи на один таймер — нормально: TA1 керується CMP1, TA2 — CMP2,
+період спільний, шпаруватість незалежна. Так із двох таймерів HRTIM
+виходить чотири незалежні канали.
+
+**Чому 4-й канал — це 3U0, а не «нуль».** У більшості терміналів РЗА є
+окремий вхід 3U0 (розімкнений трикутник), і подавати на нього треба
+незалежно від суми `Ua+Ub+Uc` — саме так перевіряють напрямлений земляний
+захист і логіку хибного 3U0. Тому канал 3 зроблений повністю незалежним
+джерелом, а не обчислюваною сумою.
+
+---
+
+## 6. Гармоніки для перевірки РЗА
+
+| Порядок | Навіщо |
+|---|---|
+| **2** | Кидок струму намагнічування трансформатора (inrush). Блокування дифзахисту, поріг зазвичай 15–20 %. Без неї перевірити блокування неможливо. |
+| **3** | Захист від замикань на землю в обмотці статора генератора (схема на 3-й гармоніці, 100 % stator earth fault), насичення ТС, нульова послідовність. |
+| **4** | Разом із 2-ю — сигнатура inrush; частина реле рахує суму парних. |
+| **5** | Перезбудження (overfluxing) трансформатора, блокування дифзахисту, поріг 25–35 %. |
+| 7 | Перетворювальне навантаження, фільтри вищих гармонік. |
+| 9 | Контроль фільтрів, кратна 3 → нульова послідовність. |
+| 11, 13 | 6- і 12-пульсні перетворювачі. Радше power quality, ніж логіка захистів. |
+
+Обов'язковий мінімум — **2, 3, 4, 5**. Діапазон до 10-ї покриває все, що
+впливає на логіку РЗА. Аперіодична складова з постійною часу — окремо,
+вона потрібна для перевірки насичення ТС і роботи дистанційного захисту.
+
+---
+
+## 7. Протокол USART3 (115200 8N1, рядки через `\n`)
+
+```
+HELP
+GET STATE [CH=n] | GET CONFIG CH=n | GET GAINS CH=n | GET CAL CH=n | GET TIME
+
+SET CH=n [AMP=] [FREQ=] [PHASE=] [APER=] [TAU=] [LOOP=0|1]
+         [H2=] [H2PH=] ... [H10=] [H10PH=]
+GAINS CH=n [FF=] [KP=] [KI=] [KR=] [WC=] [LIM=]
+CAL   CH=n [OFFS=] [SCALE=]
+SCHEDULE CH=n [AT=|ATMS=] [DUR=|DURMS=] [MODE=STEP|LINEAR] <поля як у SET>
+START [NOW|AT=|ATMS=] | STOP | CLEAR SCHEDULE | RESET LOAD
+```
+
+Одиниці: амплітуди у відліках ADC (0..2047), `FREQ` у тисячних герца
+(`50000` = 50.000 Гц), фази у тисячних градуса, `TAU` у мс
+(`0` = постійне зміщення без згасання), коефіцієнти регулятора
+у тисячних (`KP=500` → 0.5), `LIM` у тіках duty, `SCALE` у тисячних.
+
+Наростання (`MODE=LINEAR`) підтримують лише `AMP`, `FREQ`, `PHASE` —
+решта застосовується стрибком. Цього достатньо для класичних перевірок:
+пошук уставки лінійним наростанням і подача КЗ у заданий момент.
+
+Приклади:
+
+```
+SET CH=0 AMP=1200 FREQ=50000 LOOP=1
+SET CH=0 H2=200 H2PH=90000 H5=150          ; 2-а і 5-а гармоніки
+SET CH=0 APER=800 TAU=40                    ; аперіодична, τ = 40 мс
+SCHEDULE CH=0 ATMS=100 DURMS=2000 MODE=LINEAR AMP=1800   ; наростання уставки
+START NOW
+GET STATE CH=0
+```
+
+---
+
+## 8. Порядок налагодження контуру на залізі
+
+1. **Розімкнути контур:** `SET CH=0 LOOP=0`. Регулятор вимкнено,
+   працює лише feedforward.
+2. **Калібрування нуля:** `SET CH=0 AMP=0`, подивитись `FB` у
+   `GET STATE CH=0` — це і є `OFFS`. Записати: `CAL CH=0 OFFS=<значення>`.
+3. **Калібрування масштабу:** `SET CH=0 AMP=1000`, подивитись `FBPK`
+   (пік ЗЗ за період). `SCALE = 1000 / FBPK · 1000`. Записати:
+   `CAL CH=0 SCALE=<значення>`. Якщо канал інвертує — `SCALE` від'ємний.
+4. **Feedforward:** підібрати `GAINS CH=0 FF=...` так, щоб при
+   розімкненому контурі амплітуда на виході збігалася із завданням.
+5. **Замкнути:** `SET CH=0 LOOP=1`. Підняти `KP` до появи дзвону на
+   осцилографі, відкотити вдвічі.
+6. **Резонатор:** підняти `KR` до зникнення похибки на 50 Гц. `WC`
+   визначає швидкість: `WC=31400` (5 Гц) → встановлення ~32 мс,
+   тобто півтора періоди. Ширше — швидше, але менш селективно.
+7. `KI` лишити малим — він потрібен лише для придушення DC-зміщення.
+8. Перевірити `LOAD` і `OVR` у `GET STATE`.
+
+Ця послідовність потрібна лише для ручного доведення; за замовчуванням
+усе робить самокалібрування з розділу 4.
+
+Усі стартові значення — у [Task/wave_generator_config.h](Task/wave_generator_config.h).
+Це єдине місце, куди треба лізти для зміни налаштувань за замовчуванням.
+
+---
+
+## 9. Пам'ять — виміряно лінкуванням
+
+STM32F334C8T6: 64 КБ Flash, **12 КБ SRAM** + 4 КБ CCM.
+
+Збірка `arm-none-eabi-gcc 13.2`, `-O2`, `--gc-sections`, `nano.specs`:
+
+| Область | Зайнято | Доступно | Вільно |
+|---|---|---|---|
+| Flash | 44 900 Б (69 %) | 65 536 Б | 20 636 Б |
+| SRAM | 7 016 Б (57 %) | 12 288 Б | **5 272 Б** |
+| CCM RAM | 3 416 Б (83 %) | 4 096 Б | 680 Б |
+
+### Гарячі дані винесені в CCM
+
+`g_sine_lut`, `g_ch`, `g_rt`, `g_queue`, `g_hw` лежать у CCM RAM за адресою
+`0x10000000`: окрема шина, нуль wait states — це і звільняє основну SRAM,
+і трохи пришвидшує такт контуру.
+
+Для цього в `STM32F334C8TX_FLASH.ld` додано секцію `.ccm_bss (NOLOAD)`.
+Два моменти, які легко зламати:
+
+- **Секція NOLOAD, startup її не чистить і не копіює.** `startup_stm32f334c8tx.s`
+  обробляє лише `.data` і `.bss`. Тому все, що кладеться в `.ccm_bss`,
+  зобов'язане повністю заповнюватись у runtime — це роблять `memset` у
+  `WaveGenerator_BindHardware()` і `WaveGenerator_Init()`. Змінна з
+  ініціалізатором тут мовчки залишиться зі сміттям.
+- **Ім'я секції не починається з `.ccmram`** навмисно: наявна в скрипті
+  секція `.ccmram` має маску `*(.ccmram*)`, яка інакше перехоплює вміст і
+  кладе його у Flash як PROGBITS.
+
+**`g_adc_dma_buffer` навмисно залишений у звичайній SRAM** — DMA на STM32F3
+до CCM доступу не має.
+
+### Що прибрано під час переробки
+
+| Що | Скільки |
+|---|---|
+| `pwm_buffer[2][4][128]` у `Task/HAL/hrtim.c` — ніде не читався | 2 048 Б |
+| `adc_dma_buffer[2][128]` у `Task/HAL/adc.c` — ніде не заповнювався | 512 Б |
+| Купа FreeRTOS 4096 → 512 (усе створюється статично) | 3 584 Б |
+| Буфери задачі таймера FreeRTOS при `configUSE_TIMERS = 0` | ~1 130 Б |
+| Перенесення гарячих даних у CCM | 3 256 Б |
+
+Без цього нова структура просто не влізла б: сира оцінка давала ~14.5 КБ
+при 12 КБ доступних.
+
+## 10. Файли
+
+Генератор розбитий на файли за принципом «гаряче / холодне»: усе, що
+виконується в перериванні кожні 40 мкс, лежить в одному файлі
+`wave_generator_task.c`; усе інше — окремо.
+
+| Файл | Рядків | Роль |
+|---|---|---|
+| [Task/wave_generator_config.h](Task/wave_generator_config.h) | 386 | **Усі константи.** Тактування, канали, гармоніки, коефіцієнти, калібрування |
+| [Task/wave_generator_task.h](Task/wave_generator_task.h) | 194 | Публічні типи й API генератора — це те, що бачить решта прошивки |
+| [Task/wave_generator_internal.h](Task/wave_generator_internal.h) | 245 | Внутрішній інтерфейс модуля: `WgChannel`, `WgRuntime`, `extern`-глобали, дрібні `static inline` помічники. Поза модулем не включається |
+| [Task/wave_generator_task.c](Task/wave_generator_task.c) | 412 | **Гарячий шлях.** Визначення глобалів, синтез опорного сигналу, регулятор, запис duty, розпакування ADC, три HAL-колбеки. Точка входу — `HAL_ADC_ConvCpltCallback()` |
+| [Task/wave_generator_params.c](Task/wave_generator_params.c) | 212 | Перерахунок похідних величин: крок фази, зсуви гармонік, коефіцієнт загасання аперіодики, нормування підсилень |
+| [Task/wave_generator_schedule.c](Task/wave_generator_schedule.c) | 245 | Черга відкладених змін і лінійні профілі. `WgApplyDueUpdates()` — атомарне застосування кількох каналів в одному такті |
+| [Task/wave_generator_cal.c](Task/wave_generator_cal.c) | 312 | Автокалібрування на старті: скінченний автомат `SETTLE → PROBE → RUN`, МНК-оцінка підсилення каскаду, обмеження амплітуди досяжною |
+| [Task/wave_generator_hw.c](Task/wave_generator_hw.c) | 347 | **Уся HAL.** Таблиця синуса, timebase master-таймера, CMP1..CMP4 і маска ADC-тригера, нормалізація виходів HRTIM, запуск периферії, `WaveGenerator_Init()` |
+| [Task/wave_generator_api.c](Task/wave_generator_api.c) | 266 | Геттери/сеттери для рівня зв'язку, кожен під коротким критичним інтервалом |
+| [Task/uart_task.c](Task/uart_task.c) | 1043 | Розбір текстових команд USART3 |
+| [Core/Src/main.c](Core/Src/main.c) | | Ініціалізація CubeMX + прив'язка каналів у `USER CODE BEGIN 2` |
+| [VoltageImitator.ioc](VoltageImitator.ioc) | | Конфігурація периферії CubeMX |
+
+Функції гарячого шляху (`WgProcessChannel`, `WgSynthesizeReference`,
+`WgWriteDuty`, `WgUnpackAdc`) навмисно залишені `static` у
+`wave_generator_task.c` — так вони вбудовуються прямо в ISR. Перевірено по
+мапі символів: окремих символів для них немає, увесь такт — це один
+`HAL_ADC_ConvCpltCallback` на 1092 байти. Розбиття на файли не коштувало
+жодного такту.
+
+> Після додавання нових `.c` треба зробити **Refresh (F5)** проєкту в
+> STM32CubeIDE — інакше згенерований `Debug/Task/subdir.mk` їх не побачить
+> і лінкер посиплеться на невизначені символи.
+
+Перегенерація коду з `.ioc` безпечна: усі зміни в `main.c` лежать у
+секціях `USER CODE`, а конфігурація master-таймера, ADC-тригера й виходів
+HRTIM робиться в runtime із `WaveGenerator_Init()`.
+
+---
+
+## 11. Емуляція роздільності STM32H743 на цій платі
+
+Наступна ревізія планується на `STM32H743` (єдине сімейство STM32 із HRTIM
+і Ethernet одночасно). Його HRTIM не має DLL x32: роздільність 2.08 нс проти
+217 пс тут, тобто при PWM 100 кГц 4808 кроків duty замість 46080 — 12.2 біта
+замість 15.5.
+
+Чи прийнятно це — залежить від силового каскаду й LC-фільтра, і теоретично
+не вирішується. Але вирішується **на цій платі**: 46080 / 4808 = 9.6, тому
+квантування compare кроком 10 тіків емулює H743 у реальному тракті.
+
+Керується двома константами в
+[Task/wave_generator_config.h](Task/wave_generator_config.h):
+
+| `WG_DUTY_QUANT_TICKS` | `WG_DUTY_DITHER` | Що міряємо |
+|---|---|---|
+| `0` | — | Рідні 15.5 біта — еталон |
+| `10` | `0` | H743 у найгіршому випадку |
+| `10` | `1` | H743 із пом'якшенням |
+
+Виміряти при однаковому завданні THD і рівні окремих гармонік (особливо
+2-ї та 5-ї, бо саме їх подають навмисно). Якщо третій рядок близький до
+першого — перехід на H743 безпечний. Якщо ближчий до другого — або
+знижувати PWM до 50 кГц (13.2 біта), або лишатись на G4 з окремим
+мережевим чіпом.
+
+Дизеринг додає рівномірний шум в один крок квантування **перед** усіченням.
+Сенс: похибка квантування PWM не біла, вона корельована із сигналом і дає
+саме зайві гармоніки — тобто підмішується прямо в те, що ти вимірюєш.
+Дизеринг розриває кореляцію й перетворює їх на рівний шумовий фон.
+Ціна — близько 8 тактів на канал (+48 байт коду на 4 канали).
+
+---
+
+## 12. Що далі
+
+- Розпаяти канали ЗЗ 1..3 і зняти `WG_CH*_FEEDBACK_ENABLED = 0`.
+- Замінити константи з `wave_generator_config.h` на конфігурування
+  по каналу зв'язку — структури `WaveGeneratorChannelConfig`,
+  `WaveGeneratorLoopGains`, `WaveGeneratorFeedbackCal` для цього вже
+  відокремлені від логіки.
+- Енкодер (`TIM2`) і LCD (`SPI1`) поки не задіяні.
+- Провести експеримент із розділу 10 — це вирішує, чи піде наступна ревізія
+  на `STM32H743`, чи доведеться розділяти силову й мережеву частини між
+  `STM32G474` та окремим мережевим чіпом.
+- Дисциплінування фази по PPS: захоплення PPS входом таймера, повільний ФАПЧ
+  на спільний множник до `phase_step`. Структура коду вже під це готова —
+  акумулятор Q32 дозволяє підстроювання на одиниці ppb, і чіпати таймбазу
+  HRTIM при цьому не треба.

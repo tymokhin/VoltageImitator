@@ -59,7 +59,10 @@ build, this configuration file has all options turned on. */
 #define configCPU_CLOCK_HZ															( SystemCoreClock ) /*72000000*/
 #define configMAX_PRIORITIES														( 5 )
 #define configMINIMAL_STACK_SIZE													( ( unsigned short ) 130 )
-#define configTOTAL_HEAP_SIZE														( ( size_t ) ( 4096 ) )
+/* Усі задачі, стеки й потокові буфери створюються статично
+ * (xTaskCreateStatic / xStreamBufferCreateStatic), тому купа FreeRTOS
+ * фактично не використовується. 4 КБ з 12 КБ SRAM на неї - завелика ціна. */
+#define configTOTAL_HEAP_SIZE														( ( size_t ) ( 512 ) )
 #define configMAX_TASK_NAME_LEN														( 10 )
 #define configUSE_TRACE_FACILITY													0
 #define configUSE_16_BIT_TICKS														0

@@ -23,7 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include "FreeRTOS.h"
 #include "task.h"
-
+#include "uart_task.h"
 #include "wave_generator_task.h"
 /* USER CODE END Includes */
 
@@ -115,33 +115,78 @@ int main(void)
   MX_TIM2_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
-  //HAL_ADCEx_Calibration_Start(&hadc1, ADC_DIFFERENTIAL_ENDED);
-  //HAL_ADCEx_Calibration_Start(&hadc2, ADC_DIFFERENTIAL_ENDED);
+  /*
+   * Прив'язка чотирьох каналів.
+   *
+   *  ch | вихід HRTIM | таймер | compare | зворотний зв'язок
+   * ----+-------------+--------+---------+---------------------------------
+   *   0 | TA1  (PA8)  |   A    |  CMP1   | ADC1 rank1, CH3 diff PA2/PA3  <- розпаяно
+   *   1 | TA2  (PA9)  |   A    |  CMP2   | ADC1 rank2, CH11     PB0
+   *   2 | TB1  (PA10) |   B    |  CMP1   | ADC2 rank1, CH1 diff PA4
+   *   3 | TB2  (PA11) |   B    |  CMP2   | ADC2 rank2, CH3 diff PA6
+   *
+   * Два виходи на один таймер - це нормально: TA1 керується CMP1, TA2 - CMP2,
+   * період у них спільний, а шпаруватість незалежна. Так із двох таймерів
+   * виходить чотири незалежні канали.
+   */
+  WaveGeneratorHardwareConfig wave_generator_hw = {
+      .adc_master = &hadc1,
+      .adc_slave  = &hadc2,
+      .hrtim      = &hhrtim1,
+      .pwm_output_mask = HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 |
+                         HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TB2,
+      .counter_start_mask = HRTIM_TIMERID_MASTER | HRTIM_TIMERID_TIMER_A |
+                            HRTIM_TIMERID_TIMER_B,
+      .sampling_trigger_index = HRTIM_ADCTRIGGER_1,
+      .channel = {
+          [WG_CH_UA] = {
+              .hrtim_timer_index  = HRTIM_TIMERINDEX_TIMER_A,
+              .hrtim_compare_unit = HRTIM_COMPAREUNIT_1,
+              .hrtim_output       = HRTIM_OUTPUT_TA1,
+              .feedback_source    = WAVE_GENERATOR_FEEDBACK_MASTER_RANK1,
+              .feedback_enabled   = (WG_CH0_FEEDBACK_ENABLED != 0),
+          },
+          [WG_CH_UB] = {
+              .hrtim_timer_index  = HRTIM_TIMERINDEX_TIMER_A,
+              .hrtim_compare_unit = HRTIM_COMPAREUNIT_2,
+              .hrtim_output       = HRTIM_OUTPUT_TA2,
+              .feedback_source    = WAVE_GENERATOR_FEEDBACK_MASTER_RANK2,
+              .feedback_enabled   = (WG_CH1_FEEDBACK_ENABLED != 0),
+          },
+          [WG_CH_UC] = {
+              .hrtim_timer_index  = HRTIM_TIMERINDEX_TIMER_B,
+              .hrtim_compare_unit = HRTIM_COMPAREUNIT_1,
+              .hrtim_output       = HRTIM_OUTPUT_TB1,
+              .feedback_source    = WAVE_GENERATOR_FEEDBACK_SLAVE_RANK1,
+              .feedback_enabled   = (WG_CH2_FEEDBACK_ENABLED != 0),
+          },
+          [WG_CH_3U0] = {
+              .hrtim_timer_index  = HRTIM_TIMERINDEX_TIMER_B,
+              .hrtim_compare_unit = HRTIM_COMPAREUNIT_2,
+              .hrtim_output       = HRTIM_OUTPUT_TB2,
+              .feedback_source    = WAVE_GENERATOR_FEEDBACK_SLAVE_RANK2,
+              .feedback_enabled   = (WG_CH3_FEEDBACK_ENABLED != 0),
+          },
+      },
+  };
+  UartControlHardwareConfig uart_control_hw = {
+      .uart = &huart3,
+      .irqn = USART3_IRQn,
+  };
+
+  WaveGenerator_BindHardware(&wave_generator_hw);
+  WaveGenerator_Init();
+
+  UartControl_BindHardware(&uart_control_hw);
+  UartControl_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  //HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 | HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TB2);  // Enable the generation of the waveform signal on the designated output
-  //HAL_HRTIM_WaveformCounterStart(&hhrtim1, HRTIM_TIMERID_TIMER_A);
-  //HAL_HRTIM_WaveformCounterStart(&hhrtim1, HRTIM_TIMERID_TIMER_B);
-  CreatePWMTask();
-
   vTaskStartScheduler();
-
-  //pwm_task(NULL);
-
-
-
-  //uint8_t c = '1';
   while (1)
   {
-//	HAL_Delay(500);
-//
-//	HAL_UART_Transmit_IT(&huart3, &c, 1);
-//	c++;
-//	__enable_irq();
-	//HAL_NVIC_SetPriority(IRQn, PreemptPriority, SubPriority)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -267,7 +312,29 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN ADC1_Init 2 */
+  /* Час вибірки скорочено: при WG_ADC_TRIGGERS_PER_PWM тригерах на період
+   * вікно між ними 2.5 мкс, а за нього треба встигнути два ранги. З рідними
+   * 61.5 циклами це 2.06 мкс із 2.5 - будь-який джитер призводить до втрати
+   * тригера, а втрачений тригер зриває вирівнювання буфера DMA і зупиняє
+   * контур керування. Деталі - розділ 1 у wave_generator_config.h. */
+  sConfig.SingleDiff   = ADC_DIFFERENTIAL_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset       = 0;
+  sConfig.SamplingTime = WG_ADC_SAMPLETIME;
 
+  sConfig.Channel = ADC_CHANNEL_3;
+  sConfig.Rank    = ADC_REGULAR_RANK_1;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sConfig.Channel = ADC_CHANNEL_11;
+  sConfig.Rank    = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END ADC1_Init 2 */
 
 }
@@ -331,7 +398,25 @@ static void MX_ADC2_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN ADC2_Init 2 */
+  /* Те саме для slave-АЦП - див. коментар у ADC1_Init 2. */
+  sConfig.SingleDiff   = ADC_DIFFERENTIAL_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset       = 0;
+  sConfig.SamplingTime = WG_ADC_SAMPLETIME;
 
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank    = ADC_REGULAR_RANK_1;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sConfig.Channel = ADC_CHANNEL_3;
+  sConfig.Rank    = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END ADC2_Init 2 */
 
 }
